@@ -1,6 +1,7 @@
 package aws
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/structure"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/validation"
 	"github.com/terraform-providers/terraform-provider-aws/aws/internal/keyvaluetags"
+	"github.com/terraform-providers/terraform-provider-aws/aws/internal/naming"
 )
 
 func resourceAwsSnsTopic() *schema.Resource {
@@ -24,6 +26,7 @@ func resourceAwsSnsTopic() *schema.Resource {
 		Importer: &schema.ResourceImporter{
 			State: schema.ImportStatePassthrough,
 		},
+		CustomizeDiff: resourceAwsSnsTopicCustomizeDiff,
 
 		Schema: map[string]*schema.Schema{
 			"name": {
@@ -95,6 +98,17 @@ func resourceAwsSnsTopic() *schema.Resource {
 				Type:     schema.TypeString,
 				Optional: true,
 			},
+			"fifo_topic": {
+				Type:     schema.TypeBool,
+				Optional: true,
+				Default:  false,
+				ForceNew: true,
+			},
+			"content_based_deduplication": {
+				Type:     schema.TypeBool,
+				Optional: true,
+				Default:  false,
+			},
 			"lambda_success_feedback_role_arn": {
 				Type:     schema.TypeString,
 				Optional: true,
@@ -142,11 +156,23 @@ func resourceAwsSnsTopicCreate(d *schema.ResourceData, meta interface{}) error {
 		name = resource.UniqueId()
 	}
 
+	fifoTopic := d.Get("fifo_topic").(bool)
+
+	attributes := make(map[string]*string)
+	// If FifoTopic is true, then the attribute must be passed into the call to CreateTopic
+	if fifoTopic {
+		attributes["FifoTopic"] = aws.String(strconv.FormatBool(fifoTopic))
+	}
+
 	log.Printf("[DEBUG] SNS create topic: %s", name)
 
 	req := &sns.CreateTopicInput{
 		Name: aws.String(name),
 		Tags: tags,
+	}
+
+	if len(attributes) > 0 {
+		req.Attributes = attributes
 	}
 
 	output, err := snsconn.CreateTopic(req)
@@ -202,6 +228,12 @@ func resourceAwsSnsTopicCreate(d *schema.ResourceData, meta interface{}) error {
 	if d.HasChange("kms_master_key_id") {
 		_, v := d.GetChange("kms_master_key_id")
 		if err := updateAwsSnsTopicAttribute(d.Id(), "KmsMasterKeyId", v, snsconn); err != nil {
+			return err
+		}
+	}
+	if d.HasChange("content_based_deduplication") {
+		_, v := d.GetChange("content_based_deduplication")
+		if err := updateAwsSnsTopicAttribute(d.Id(), "ContentBasedDeduplication", v, snsconn); err != nil {
 			return err
 		}
 	}
@@ -315,6 +347,12 @@ func resourceAwsSnsTopicUpdate(d *schema.ResourceData, meta interface{}) error {
 			return err
 		}
 	}
+	if d.HasChange("content_based_deduplication") {
+		_, v := d.GetChange("content_based_deduplication")
+		if err := updateAwsSnsTopicAttribute(d.Id(), "ContentBasedDeduplication", v, snsconn); err != nil {
+			return err
+		}
+	}
 	if d.HasChange("lambda_failure_feedback_role_arn") {
 		_, v := d.GetChange("lambda_failure_feedback_role_arn")
 		if err := updateAwsSnsTopicAttribute(d.Id(), "LambdaFailureFeedbackRoleArn", v, snsconn); err != nil {
@@ -415,6 +453,16 @@ func resourceAwsSnsTopicRead(d *schema.ResourceData, meta interface{}) error {
 		d.Set("sqs_failure_feedback_role_arn", aws.StringValue(attributeOutput.Attributes["SQSFailureFeedbackRoleArn"]))
 		d.Set("sqs_success_feedback_role_arn", aws.StringValue(attributeOutput.Attributes["SQSSuccessFeedbackRoleArn"]))
 
+		// set the boolean values
+		d.Set("fifo_topic", false)
+		if v, ok := attributeOutput.Attributes["FifoTopic"]; ok && aws.StringValue(v) == "true" {
+			d.Set("fifo_topic", true)
+		}
+		d.Set("content_based_deduplication", false)
+		if v, ok := attributeOutput.Attributes["ContentBasedDeduplication"]; ok && aws.StringValue(v) == "true" {
+			d.Set("content_based_deduplication", true)
+		}
+
 		// set the number values
 		var vStr string
 		var v int64
@@ -490,6 +538,33 @@ func resourceAwsSnsTopicDelete(d *schema.ResourceData, meta interface{}) error {
 	})
 
 	return err
+}
+
+func resourceAwsSnsTopicCustomizeDiff(_ context.Context, diff *schema.ResourceDiff, meta interface{}) error {
+	fifoTopic := diff.Get("fifo_topic").(bool)
+	contentBasedDeduplication := diff.Get("content_based_deduplication").(bool)
+
+	if diff.Id() == "" {
+		// Create.
+
+		name := naming.Generate(diff.Get("name").(string), diff.Get("name_prefix").(string))
+
+		if fifoTopic {
+			if errors := validateSNSFifoTopicName(name); len(errors) > 0 {
+				return fmt.Errorf("Error validating the SNS FIFO topic name: %v", errors)
+			}
+		} else {
+			if errors := validateSNSNonFifoTopicName(name); len(errors) > 0 {
+				return fmt.Errorf("Error validating SNS topic name: %v", errors)
+			}
+		}
+	}
+
+	if !fifoTopic && contentBasedDeduplication {
+		return fmt.Errorf("Content based deduplication can only be set with FIFO topics")
+	}
+
+	return nil
 }
 
 func updateAwsSnsTopicAttribute(topicArn, name string, value interface{}, conn *sns.SNS) error {
